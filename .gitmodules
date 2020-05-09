@@ -1,0 +1,6 @@
+[submodule "debugger-libs"]
+	path = debugger-libs
+	url = git@github.com:mono/debugger-libs.git
+[submodule "nrefactory"]
+	path = nrefactory
+	url = https://github.com/xamarin/NRefactory

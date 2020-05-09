@@ -9,11 +9,14 @@ using System.Threading;
 using System.Linq;
 using System.Net;
 using Mono.Debugging.Client;
-
+using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
+using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
+using Thread = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Thread;
+using Newtonsoft.Json.Linq;
 
 namespace VSCodeDebug
 {
-	public class MonoDebugSession : DebugSession
+	public class MonoDebugSession : DebugAdapterBase
 	{
 		private const string MONO = "mono";
 		private readonly string[] MONO_EXTENSIONS = new String[] {
@@ -48,8 +51,10 @@ namespace VSCodeDebug
 		private bool _stderrEOF = true;
 		private bool _stdoutEOF = true;
 
+		private bool _clientLinesStartAt1 = true;
+		private bool _clientPathsAreURI = true;
 
-		public MonoDebugSession() : base()
+		public MonoDebugSession (Stream input, Stream output)
 		{
 			_variableHandles = new Handles<ObjectValue[]>();
 			_frameHandles = new Handles<Mono.Debugging.Client.StackFrame>();
@@ -76,13 +81,13 @@ namespace VSCodeDebug
 
 			_session.TargetStopped += (sender, e) => {
 				Stopped();
-				SendEvent(CreateStoppedEvent("step", e.Thread));
+				Protocol.SendEvent(CreateStoppedEvent(StoppedEvent.ReasonValue.Step, e.Thread));
 				_resumeEvent.Set();
 			};
 
 			_session.TargetHitBreakpoint += (sender, e) => {
 				Stopped();
-				SendEvent(CreateStoppedEvent("breakpoint", e.Thread));
+				Protocol.SendEvent(CreateStoppedEvent(StoppedEvent.ReasonValue.Breakpoint, e.Thread));
 				_resumeEvent.Set();
 			};
 
@@ -91,7 +96,7 @@ namespace VSCodeDebug
 				var ex = DebuggerActiveException();
 				if (ex != null) {
 					_exception = ex.Instance;
-					SendEvent(CreateStoppedEvent("exception", e.Thread, ex.Message));
+					Protocol.SendEvent(CreateStoppedEvent(StoppedEvent.ReasonValue.Exception, e.Thread, ex.Message));
 				}
 				_resumeEvent.Set();
 			};
@@ -101,7 +106,7 @@ namespace VSCodeDebug
 				var ex = DebuggerActiveException();
 				if (ex != null) {
 					_exception = ex.Instance;
-					SendEvent(CreateStoppedEvent("exception", e.Thread, ex.Message));
+					Protocol.SendEvent(CreateStoppedEvent(StoppedEvent.ReasonValue.Exception, e.Thread, ex.Message));
 				}
 				_resumeEvent.Set();
 			};
@@ -137,7 +142,7 @@ namespace VSCodeDebug
 				lock (_seenThreads) {
 					_seenThreads[tid] = new Thread(tid, e.Thread.Name);
 				}
-				SendEvent(new ThreadEvent("started", tid));
+				Protocol.SendEvent(new ThreadEvent(ThreadEvent.ReasonValue.Started, tid));
 			};
 
 			_session.TargetThreadStopped += (sender, e) => {
@@ -145,279 +150,78 @@ namespace VSCodeDebug
 				lock (_seenThreads) {
 					_seenThreads.Remove(tid);
 				}
-				SendEvent(new ThreadEvent("exited", tid));
+				Protocol.SendEvent(new ThreadEvent(ThreadEvent.ReasonValue.Exited, tid));
 			};
 
 			_session.OutputWriter = (isStdErr, text) => {
-				SendOutput(isStdErr ? "stderr" : "stdout", text);
+				Protocol.SendEvent(new OutputEvent(text)
+				{
+					Category = isStdErr ? OutputEvent.CategoryValue.Stderr : OutputEvent.CategoryValue.Stdout
+				});
+			};
+
+
+			this.InitializeProtocolClient(input, output);
+		}
+
+		public void Run() => Protocol.Run();
+
+		protected override InitializeResponse HandleInitializeRequest(InitializeArguments arguments)
+		{
+			_clientLinesStartAt1 = arguments.LinesStartAt1.GetValueOrDefault(true);
+			_clientPathsAreURI = arguments.PathFormat == InitializeArguments.PathFormatValue.Uri;
+			return new InitializeResponse()
+			{
+				// This debug adapter does not need the configurationDoneRequest.
+				SupportsConfigurationDoneRequest = false,
+
+				// This debug adapter does not support function breakpoints.
+				SupportsFunctionBreakpoints = false,
+
+				// This debug adapter doesn't support conditional breakpoints.
+				SupportsConditionalBreakpoints = false,
+
+				// This debug adapter does not support a side effect free evaluate request for data hovers.
+				SupportsEvaluateForHovers = false,
+
+				// This debug adapter does not support exception breakpoint filters
+				ExceptionBreakpointFilters = new List<ExceptionBreakpointsFilter>()
 			};
 		}
 
-		public override void Initialize(Response response, dynamic args)
-		{
-			OperatingSystem os = Environment.OSVersion;
-			if (os.Platform != PlatformID.MacOSX && os.Platform != PlatformID.Unix && os.Platform != PlatformID.Win32NT) {
-				SendErrorResponse(response, 3000, "Mono Debug is not supported on this platform ({_platform}).", new { _platform = os.Platform.ToString() }, true, true);
-				return;
-			}
-
-			SendResponse(response, new Capabilities() {
-				// This debug adapter does not need the configurationDoneRequest.
-				supportsConfigurationDoneRequest = false,
-
-				// This debug adapter does not support function breakpoints.
-				supportsFunctionBreakpoints = false,
-
-				// This debug adapter doesn't support conditional breakpoints.
-				supportsConditionalBreakpoints = false,
-
-				// This debug adapter does not support a side effect free evaluate request for data hovers.
-				supportsEvaluateForHovers = false,
-
-				// This debug adapter does not support exception breakpoint filters
-				exceptionBreakpointFilters = new dynamic[0]
-			});
-
-			// Mono Debug is ready to accept breakpoints immediately
-			SendEvent(new InitializedEvent());
-		}
-
-		public override async void Launch(Response response, dynamic args)
-		{
-			_attachMode = false;
-
-			SetExceptionBreakpoints(args.__exceptionOptions);
-
-			// validate argument 'program'
-			string programPath = getString(args, "program");
-			if (programPath == null) {
-				SendErrorResponse(response, 3001, "Property 'program' is missing or empty.", null);
-				return;
-			}
-			programPath = ConvertClientPathToDebugger(programPath);
-			if (!File.Exists(programPath) && !Directory.Exists(programPath)) {
-				SendErrorResponse(response, 3002, "Program '{path}' does not exist.", new { path = programPath });
-				return;
-			}
-
-			// validate argument 'cwd'
-			var workingDirectory = (string)args.cwd;
-			if (workingDirectory != null) {
-				workingDirectory = workingDirectory.Trim();
-				if (workingDirectory.Length == 0) {
-					SendErrorResponse(response, 3003, "Property 'cwd' is empty.");
-					return;
-				}
-				workingDirectory = ConvertClientPathToDebugger(workingDirectory);
-				if (!Directory.Exists(workingDirectory)) {
-					SendErrorResponse(response, 3004, "Working directory '{path}' does not exist.", new { path = workingDirectory });
-					return;
-				}
-			}
-
-			// validate argument 'runtimeExecutable'
-			var runtimeExecutable = (string)args.runtimeExecutable;
-			if (runtimeExecutable != null) {
-				runtimeExecutable = runtimeExecutable.Trim();
-				if (runtimeExecutable.Length == 0) {
-					SendErrorResponse(response, 3005, "Property 'runtimeExecutable' is empty.");
-					return;
-				}
-				runtimeExecutable = ConvertClientPathToDebugger(runtimeExecutable);
-				if (!File.Exists(runtimeExecutable)) {
-					SendErrorResponse(response, 3006, "Runtime executable '{path}' does not exist.", new { path = runtimeExecutable });
-					return;
-				}
-			}
-
-
-			// validate argument 'env'
-			Dictionary<string, string> env = null;
-			var environmentVariables = args.env;
-			if (environmentVariables != null) {
-				env = new Dictionary<string, string>();
-				foreach (var entry in environmentVariables) {
-					env.Add((string)entry.Name, (string)entry.Value);
-				}
-				if (env.Count == 0) {
-					env = null;
-				}
-			}
-
-			const string host = "127.0.0.1";
-			int port = Utilities.FindFreePort(55555);
-
-			string mono_path = runtimeExecutable;
-			if (mono_path == null) {
-				if (!Utilities.IsOnPath(MONO)) {
-					SendErrorResponse(response, 3011, "Can't find runtime '{_runtime}' on PATH.", new { _runtime = MONO });
-					return;
-				}
-				mono_path = MONO;     // try to find mono through PATH
-			}
-
-
-			var cmdLine = new List<String>();
-
-			bool debug = !getBool(args, "noDebug", false);
-			if (debug) {
-				cmdLine.Add("--debug");
-				cmdLine.Add(String.Format("--debugger-agent=transport=dt_socket,server=y,address={0}:{1}", host, port));
-			}
-
-			// add 'runtimeArgs'
-			if (args.runtimeArgs != null) {
-				string[] runtimeArguments = args.runtimeArgs.ToObject<string[]>();
-				if (runtimeArguments != null && runtimeArguments.Length > 0) {
-					cmdLine.AddRange(runtimeArguments);
-				}
-			}
-
-			// add 'program'
-			if (workingDirectory == null) {
-				// if no working dir given, we use the direct folder of the executable
-				workingDirectory = Path.GetDirectoryName(programPath);
-				cmdLine.Add(Path.GetFileName(programPath));
-			}
-			else {
-				// if working dir is given and if the executable is within that folder, we make the program path relative to the working dir
-				cmdLine.Add(Utilities.MakeRelativePath(workingDirectory, programPath));
-			}
-
-			// add 'args'
-			if (args.args != null) {
-				string[] arguments = args.args.ToObject<string[]>();
-				if (arguments != null && arguments.Length > 0) {
-					cmdLine.AddRange(arguments);
-				}
-			}
-
-			// what console?
-			var console = getString(args, "console", null);
-			if (console == null) {
-				// continue to read the deprecated "externalConsole" attribute
-				bool externalConsole = getBool(args, "externalConsole", false);
-				if (externalConsole) {
-					console = "externalTerminal";
-				}
-			}
-
-			if (console == "externalTerminal" || console == "integratedTerminal") {
-
-				cmdLine.Insert(0, mono_path);
-
-				var termArgs = new {
-					kind = console == "integratedTerminal" ? "integrated" : "external",
-					title = "Node Debug Console",
-					cwd = workingDirectory,
-					args = cmdLine.ToArray(),
-					env = environmentVariables
-				};
-
-				var resp = await SendRequest("runInTerminal", termArgs);
-				if (!resp.success) {
-					SendErrorResponse(response, 3011, "Cannot launch debug target in terminal ({_error}).", new { _error = resp.message });
-					return;
-				}
-
-			} else { // internalConsole
-
-				_process = new System.Diagnostics.Process();
-				_process.StartInfo.CreateNoWindow = true;
-				_process.StartInfo.UseShellExecute = false;
-				_process.StartInfo.WorkingDirectory = workingDirectory;
-				_process.StartInfo.FileName = mono_path;
-				_process.StartInfo.Arguments = Utilities.ConcatArgs(cmdLine.ToArray());
-
-				_stdoutEOF = false;
-				_process.StartInfo.RedirectStandardOutput = true;
-				_process.OutputDataReceived += (object sender, System.Diagnostics.DataReceivedEventArgs e) => {
-					if (e.Data == null) {
-						_stdoutEOF = true;
-					}
-					SendOutput("stdout", e.Data);
-				};
-
-				_stderrEOF = false;
-				_process.StartInfo.RedirectStandardError = true;
-				_process.ErrorDataReceived += (object sender, System.Diagnostics.DataReceivedEventArgs e) => {
-					if (e.Data == null) {
-						_stderrEOF = true;
-					}
-					SendOutput("stderr", e.Data);
-				};
-
-				_process.EnableRaisingEvents = true;
-				_process.Exited += (object sender, EventArgs e) => {
-					Terminate("runtime process exited");
-				};
-
-				if (env != null) {
-					// we cannot set the env vars on the process StartInfo because we need to set StartInfo.UseShellExecute to true at the same time.
-					// instead we set the env vars on MonoDebug itself because we know that MonoDebug lives as long as a debug session.
-					foreach (var entry in env) {
-						System.Environment.SetEnvironmentVariable(entry.Key, entry.Value);
-					}
-				}
-
-				var cmd = string.Format("{0} {1}", mono_path, _process.StartInfo.Arguments);
-				SendOutput("console", cmd);
-
-				try {
-					_process.Start();
-					_process.BeginOutputReadLine();
-					_process.BeginErrorReadLine();
-				}
-				catch (Exception e) {
-					SendErrorResponse(response, 3012, "Can't launch terminal ({reason}).", new { reason = e.Message });
-					return;
-				}
-			}
-
-			if (debug) {
-				Connect(IPAddress.Parse(host), port);
-			}
-
-			SendResponse(response);
-
-			if (_process == null && !debug) {
-				// we cannot track mono runtime process so terminate this session
-				Terminate("cannot track mono runtime");
-			}
-		}
-
-		public override void Attach(Response response, dynamic args)
+		protected override AttachResponse HandleAttachRequest(AttachArguments arguments)
 		{
 			_attachMode = true;
 
-			SetExceptionBreakpoints(args.__exceptionOptions);
+			SetExceptionBreakpoints(arguments.ConfigurationProperties["__exceptionOptions"]);
 
 			// validate argument 'address'
-			var host = getString(args, "address");
+			var host = getString(arguments.ConfigurationProperties, "address");
 			if (host == null) {
-				SendErrorResponse(response, 3007, "Property 'address' is missing or empty.");
-				return;
+				throw new ProtocolException("Property 'address' is missing or empty.", new Message(3007, "Property 'address' is missing or empty."));
 			}
 
 			// validate argument 'port'
-			var port = getInt(args, "port", -1);
+			var port = getInt(arguments.ConfigurationProperties, "port", -1);
 			if (port == -1) {
-				SendErrorResponse(response, 3008, "Property 'port' is missing.");
-				return;
+				throw new ProtocolException("Property 'port' is missing.", new Message(3008, "Property 'port' is missing."));
 			}
 
 			IPAddress address = Utilities.ResolveIPAddress(host);
 			if (address == null) {
-				SendErrorResponse(response, 3013, "Invalid address '{address}'.", new { address = address });
-				return;
+				throw new ProtocolException("Invalid address", new Message(3013, "Invalid address '{address}'.") {
+					Variables = new Dictionary<string, object> {
+						{ "address", address }
+					}
+				});
 			}
 
 			Connect(address, port);
 
-			SendResponse(response);
+			return new AttachResponse();
 		}
 
-		public override void Disconnect(Response response, dynamic args)
+		protected override DisconnectResponse HandleDisconnectRequest(DisconnectArguments arguments)
 		{
 			if (_attachMode) {
 
@@ -446,93 +250,90 @@ namespace VSCodeDebug
 				}
 			}
 
-			SendResponse(response);
+			return new DisconnectResponse();
 		}
 
-		public override void Continue(Response response, dynamic args)
+		protected override ContinueResponse HandleContinueRequest(ContinueArguments arguments)
 		{
 			WaitForSuspend();
-			SendResponse(response);
 			lock (_lock) {
 				if (_session != null && !_session.IsRunning && !_session.HasExited) {
 					_session.Continue();
 					_debuggeeExecuting = true;
 				}
 			}
+			return new ContinueResponse();
 		}
 
-		public override void Next(Response response, dynamic args)
+		protected override NextResponse HandleNextRequest(NextArguments arguments)
 		{
 			WaitForSuspend();
-			SendResponse(response);
 			lock (_lock) {
 				if (_session != null && !_session.IsRunning && !_session.HasExited) {
 					_session.NextLine();
 					_debuggeeExecuting = true;
 				}
 			}
+			return new NextResponse();
 		}
 
-		public override void StepIn(Response response, dynamic args)
+		protected override StepInResponse HandleStepInRequest(StepInArguments arguments)
 		{
 			WaitForSuspend();
-			SendResponse(response);
 			lock (_lock) {
 				if (_session != null && !_session.IsRunning && !_session.HasExited) {
 					_session.StepLine();
 					_debuggeeExecuting = true;
 				}
 			}
+			return new StepInResponse();
 		}
 
-		public override void StepOut(Response response, dynamic args)
+		protected override StepOutResponse HandleStepOutRequest(StepOutArguments arguments)
 		{
 			WaitForSuspend();
-			SendResponse(response);
 			lock (_lock) {
 				if (_session != null && !_session.IsRunning && !_session.HasExited) {
 					_session.Finish();
 					_debuggeeExecuting = true;
 				}
 			}
+			return new StepOutResponse();
 		}
 
-		public override void Pause(Response response, dynamic args)
+		protected override PauseResponse HandlePauseRequest(PauseArguments arguments)
 		{
-			SendResponse(response);
 			PauseDebugger();
+			return new PauseResponse();
 		}
 
-		public override void SetExceptionBreakpoints(Response response, dynamic args)
+		protected override SetExceptionBreakpointsResponse HandleSetExceptionBreakpointsRequest(SetExceptionBreakpointsArguments arguments)
 		{
-			SetExceptionBreakpoints(args.exceptionOptions);
-			SendResponse(response);
+			SetExceptionBreakpoints(arguments.ExceptionOptions);
+			return new SetExceptionBreakpointsResponse();
 		}
 
-		public override void SetBreakpoints(Response response, dynamic args)
+		protected override SetBreakpointsResponse HandleSetBreakpointsRequest(SetBreakpointsArguments arguments)
 		{
 			string path = null;
-			if (args.source != null) {
-				string p = (string)args.source.path;
+			if (arguments.Source != null) {
+				string p = arguments.Source.Path;
 				if (p != null && p.Trim().Length > 0) {
 					path = p;
 				}
 			}
 			if (path == null) {
-				SendErrorResponse(response, 3010, "setBreakpoints: property 'source' is empty or misformed", null, false, true);
-				return;
+				throw new ProtocolException("setBreakpoints: property 'source' is empty or misformed", new Message(3010, "setBreakpoints: property 'source' is empty or misformed"));
 			}
 			path = ConvertClientPathToDebugger(path);
 
 			if (!HasMonoExtension(path)) {
-				// we only support breakpoints in files mono can handle
-				SendResponse(response, new SetBreakpointsResponseBody());
-				return;
+				return new SetBreakpointsResponse();
 			}
 
-			var clientLines = args.lines.ToObject<int[]>();
+			var clientLines = arguments.Lines;
 			HashSet<int> lin = new HashSet<int>();
-			for (int i = 0; i < clientLines.Length; i++) {
+			for (int i = 0; i < clientLines.Count; i++) {
 				lin.Add(ConvertClientLineToDebugger(clientLines[i]));
 			}
 
@@ -561,7 +362,7 @@ namespace VSCodeDebug
 				}
 			}
 
-			for (int i = 0; i < clientLines.Length; i++) {
+			for (int i = 0; i < clientLines.Count; i++) {
 				var l = ConvertClientLineToDebugger(clientLines[i]);
 				if (!lin2.Contains(l)) {
 					var id = _nextBreakpointId++;
@@ -570,18 +371,18 @@ namespace VSCodeDebug
 				}
 			}
 
-			var breakpoints = new List<Breakpoint>();
+			var breakpoints = new List<Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Breakpoint>();
 			foreach (var l in clientLines) {
-				breakpoints.Add(new Breakpoint(true, l));
+				breakpoints.Add(new Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Breakpoint(true) { Line = l });
 			}
 
-			SendResponse(response, new SetBreakpointsResponseBody(breakpoints));
+			return new SetBreakpointsResponse(breakpoints);
 		}
 
-		public override void StackTrace(Response response, dynamic args)
+		protected override StackTraceResponse HandleStackTraceRequest(StackTraceArguments arguments)
 		{
-			int maxLevels = getInt(args, "levels", 10);
-			int threadReference = getInt(args, "threadId", 0);
+			int maxLevels = arguments.Levels.GetValueOrDefault(10);
+			int threadReference = arguments.ThreadId;
 
 			WaitForSuspend();
 
@@ -594,7 +395,7 @@ namespace VSCodeDebug
 				}
 			}
 
-			var stackFrames = new List<StackFrame>();
+			var stackFrames = new List<Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.StackFrame>();
 			int totalFrames = 0;
 
 			var bt = thread.Backtrace;
@@ -608,16 +409,28 @@ namespace VSCodeDebug
 
 					string path = frame.SourceLocation.FileName;
 
-					var hint = "subtle";
+					var hint = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.StackFrame.PresentationHintValue.Subtle;
 					Source source = null;
 					if (!string.IsNullOrEmpty(path)) {
 						string sourceName = Path.GetFileName(path);
 						if (!string.IsNullOrEmpty(sourceName)) {
 							if (File.Exists(path)) {
-								source = new Source(sourceName, ConvertDebuggerPathToClient(path), 0, "normal");
-								hint = "normal";
+								source = new Source
+								{
+									Name = sourceName,
+									Path = ConvertDebuggerPathToClient(path),
+									SourceReference = 0,
+									PresentationHint = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Source.PresentationHintValue.Normal
+								};
+								hint = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.StackFrame.PresentationHintValue.Normal;
 							} else {
-								source = new Source(sourceName, null, 1000, "deemphasize");
+								source = new Source()
+								{
+									Name = sourceName,
+									Path = null,
+									SourceReference = 1000,
+									PresentationHint = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Source.PresentationHintValue.Deemphasize
+								};
 							}
 						}
 					}
@@ -625,42 +438,46 @@ namespace VSCodeDebug
 					var frameHandle = _frameHandles.Create(frame);
 					string name = frame.SourceLocation.MethodName;
 					int line = frame.SourceLocation.Line;
-					stackFrames.Add(new StackFrame(frameHandle, name, source, ConvertDebuggerLineToClient(line), 0, hint));
+					stackFrames.Add(new Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.StackFrame(frameHandle, name, ConvertDebuggerLineToClient(line), 0)
+					{
+						Source = source,
+						PresentationHint = hint
+					});
 				}
 			}
 
-			SendResponse(response, new StackTraceResponseBody(stackFrames, totalFrames));
+			return new StackTraceResponse(stackFrames) { TotalFrames = totalFrames };
 		}
 
-		public override void Source(Response response, dynamic arguments) {
-			SendErrorResponse(response, 1020, "No source available");
+		protected override SourceResponse HandleSourceRequest(SourceArguments arguments)
+		{
+			throw new ProtocolException("No source available", new Message(1020, "No source available"));
 		}
 
-		public override void Scopes(Response response, dynamic args) {
-
-			int frameId = getInt(args, "frameId", 0);
+		protected override ScopesResponse HandleScopesRequest(ScopesArguments arguments)
+		{
+			int frameId = arguments.FrameId;
 			var frame = _frameHandles.Get(frameId, null);
 
 			var scopes = new List<Scope>();
 
 			if (frame.Index == 0 && _exception != null) {
-				scopes.Add(new Scope("Exception", _variableHandles.Create(new ObjectValue[] { _exception })));
+				scopes.Add(new Scope("Exception", _variableHandles.Create(new ObjectValue[] { _exception }), false));
 			}
 
 			var locals = new[] { frame.GetThisReference() }.Concat(frame.GetParameters()).Concat(frame.GetLocalVariables()).Where(x => x != null).ToArray();
 			if (locals.Length > 0) {
-				scopes.Add(new Scope("Local", _variableHandles.Create(locals)));
+				scopes.Add(new Scope("Local", _variableHandles.Create(locals), false));
 			}
 
-			SendResponse(response, new ScopesResponseBody(scopes));
+			return new ScopesResponse(scopes);
 		}
 
-		public override void Variables(Response response, dynamic args)
+		protected override VariablesResponse HandleVariablesRequest(VariablesArguments arguments)
 		{
-			int reference = getInt(args, "variablesReference", -1);
+			int reference = arguments.VariablesReference;
 			if (reference == -1) {
-				SendErrorResponse(response, 3009, "variables: property 'variablesReference' is missing", null, false, true);
-				return;
+				throw new ProtocolException("variables: property 'variablesReference' is missing", new Message(3009, "variables: property 'variablesReference' is missing"));
 			}
 
 			WaitForSuspend();
@@ -691,15 +508,15 @@ namespace VSCodeDebug
 					}
 
 					if (more) {
-						variables.Add(new Variable("...", null, null));
+						variables.Add(new Variable("...", null, 0));
 					}
 				}
 			}
 
-			SendResponse(response, new VariablesResponseBody(variables));
+			return new VariablesResponse(variables);
 		}
 
-		public override void Threads(Response response, dynamic args)
+		protected override ThreadsResponse HandleThreadsRequest(ThreadsArguments arguments)
 		{
 			var threads = new List<Thread>();
 			var process = _activeProcess;
@@ -714,18 +531,18 @@ namespace VSCodeDebug
 				}
 				threads = d.Values.ToList();
 			}
-			SendResponse(response, new ThreadsResponseBody(threads));
+			return new ThreadsResponse(threads);
 		}
 
-		public override void Evaluate(Response response, dynamic args)
+		protected override EvaluateResponse HandleEvaluateRequest(EvaluateArguments arguments)
 		{
 			string error = null;
 
-			var expression = getString(args, "expression");
+			var expression = arguments.Expression;
 			if (expression == null) {
 				error = "expression missing";
 			} else {
-				int frameId = getInt(args, "frameId", -1);
+				int frameId = arguments.FrameId.GetValueOrDefault(-1);
 				var frame = _frameHandles.Get(frameId, null);
 				if (frame != null) {
 					if (frame.ValidateExpression(expression)) {
@@ -750,8 +567,7 @@ namespace VSCodeDebug
 							if (val.HasChildren) {
 								handle = _variableHandles.Create(val.GetAllChildren());
 							}
-							SendResponse(response, new EvaluateResponseBody(val.DisplayValue, handle));
-							return;
+							return new EvaluateResponse(val.DisplayValue, handle);
 						}
 					}
 					else {
@@ -762,14 +578,23 @@ namespace VSCodeDebug
 					error = "no active stackframe";
 				}
 			}
-			SendErrorResponse(response, 3014, "Evaluate request failed ({_reason}).", new { _reason = error } );
+			throw new ProtocolException("Evaluate request failed", new Message(3014, "Evaluate request failed ({_reason}).")
+			{
+				Variables = new Dictionary<string, object> { { "_reason", error } }
+			});
 		}
 
 		//---- private ------------------------------------------
 
-		private void SetExceptionBreakpoints(dynamic exceptionOptions)
+		private void SetExceptionBreakpoints(JToken exceptionOptions)
 		{
-			if (exceptionOptions != null) {
+			var exceptions = exceptionOptions.ToObject<ExceptionOptions[]>();
+			SetExceptionBreakpoints(exceptions);
+		}
+
+		private void SetExceptionBreakpoints(IEnumerable<ExceptionOptions> exceptions)
+		{
+			if (exceptions != null) {
 
 				// clear all existig catchpoints
 				foreach (var cp in _catchpoints) {
@@ -777,38 +602,34 @@ namespace VSCodeDebug
 				}
 				_catchpoints.Clear();
 
-				var exceptions = exceptionOptions.ToObject<dynamic[]>();
-				for (int i = 0; i < exceptions.Length; i++) {
-
-					var exception = exceptions[i];
-
+				foreach (var exception in exceptions) {
 					string exName = null;
-					string exBreakMode = exception.breakMode;
+					var exBreakMode = exception.BreakMode;
 
-					if (exception.path != null) {
-						var paths = exception.path.ToObject<dynamic[]>();
+					if (exception.Path != null) {
+						var paths = exception.Path;
 						var path = paths[0];
-						if (path.names != null) {
-							var names = path.names.ToObject<dynamic[]>();
-							if (names.Length > 0) {
+						if (path.Names != null) {
+							var names = path.Names;
+							if (names.Count > 0) {
 								exName = names[0];
 							}
 						}
 					}
 
-					if (exName != null && exBreakMode == "always") {
+					if (exName != null && exBreakMode == ExceptionBreakMode.Always) {
 						_catchpoints.Add(_session.Breakpoints.AddCatchpoint(exName));
 					}
 				}
 			}
 		}
 
-		private void SendOutput(string category, string data) {
+		private void SendOutput(OutputEvent.CategoryValue? category, string data) {
 			if (!String.IsNullOrEmpty(data)) {
 				if (data[data.Length-1] != '\n') {
 					data += '\n';
 				}
-				SendEvent(new OutputEvent(category, data));
+				Protocol.SendEvent(new OutputEvent(data) { Category = category });
 			}
 		}
 
@@ -820,17 +641,18 @@ namespace VSCodeDebug
 					System.Threading.Thread.Sleep(100);
 				}
 
-				SendEvent(new TerminatedEvent());
+				Protocol.SendEvent (new TerminatedEvent());
 
 				_terminated = true;
 				_process = null;
 			}
 		}
 
-		private StoppedEvent CreateStoppedEvent(string reason, ThreadInfo ti, string text = null)
+		private StoppedEvent CreateStoppedEvent(StoppedEvent.ReasonValue reason, ThreadInfo ti, string text = null) => new StoppedEvent(reason)
 		{
-			return new StoppedEvent((int)ti.Id, reason, text);
-		}
+			ThreadId = (int)ti.Id,
+			Text = text
+		};
 
 		private ThreadInfo FindThread(int threadReference)
 		{
@@ -857,7 +679,10 @@ namespace VSCodeDebug
 			if (dv.Length > 1 && dv [0] == '{' && dv [dv.Length - 1] == '}') {
 				dv = dv.Substring (1, dv.Length - 2);
 			}
-			return new Variable(v.Name, dv, v.TypeName, v.HasChildren ? _variableHandles.Create(v.GetAllChildren()) : 0);
+			return new Variable(v.Name, dv, v.HasChildren ? _variableHandles.Create(v.GetAllChildren()) : 0)
+			{
+				Type = v.TypeName
+			};
 		}
 
 		private bool HasMonoExtension(string path)
@@ -881,10 +706,10 @@ namespace VSCodeDebug
 			return dflt;
 		}
 
-		private static int getInt(dynamic container, string propertyName, int dflt = 0)
+		private static int getInt(Dictionary<string, JToken> args, string propertyName, int dflt = 0)
 		{
 			try {
-				return (int)container[propertyName];
+				return (int)args[propertyName];
 			}
 			catch (Exception) {
 				// ignore and return default value
@@ -892,9 +717,9 @@ namespace VSCodeDebug
 			return dflt;
 		}
 
-		private static string getString(dynamic args, string property, string dflt = null)
+		private static string getString(Dictionary<string, JToken> args, string property, string dflt = null)
 		{
-			var s = (string)args[property];
+			var s = args[property].ToObject<string> ();
 			if (s == null) {
 				return dflt;
 			}
@@ -981,6 +806,59 @@ namespace VSCodeDebug
 					_session.Dispose();
 					_session = null;
 				}
+			}
+		}
+
+		private int ConvertDebuggerLineToClient(int line)
+		{
+			return _clientLinesStartAt1 ? line : line - 1;
+		}
+
+		private int ConvertClientLineToDebugger(int line)
+		{
+			return _clientLinesStartAt1 ? line : line + 1;
+		}
+
+		private string ConvertDebuggerPathToClient(string path)
+		{
+			if (_clientPathsAreURI)
+			{
+				try
+				{
+					var uri = new System.Uri(path);
+					return uri.AbsoluteUri;
+				}
+				catch
+				{
+					return null;
+				}
+			}
+			else
+			{
+				return path;
+			}
+		}
+
+		private string ConvertClientPathToDebugger(string clientPath)
+		{
+			if (clientPath == null)
+			{
+				return null;
+			}
+
+			if (_clientPathsAreURI)
+			{
+				if (Uri.IsWellFormedUriString(clientPath, UriKind.Absolute))
+				{
+					Uri uri = new Uri(clientPath);
+					return uri.LocalPath;
+				}
+				Program.Log("path not well formed: '{0}'", clientPath);
+				return null;
+			}
+			else
+			{
+				return clientPath;
 			}
 		}
 	}

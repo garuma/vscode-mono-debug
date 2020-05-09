@@ -8,7 +8,8 @@ import * as vscode from 'vscode';
 import * as nls from 'vscode-nls';
 import { DebugProtocol } from 'vscode-debugprotocol';
 
-const localize = nls.config(process.env.VSCODE_NLS_CONFIG)();
+const config = JSON.parse(process.env.VSCODE_NLS_CONFIG)
+const localize = nls.config(config)();
 
 const configuration = vscode.workspace.getConfiguration('mono-debug');
 

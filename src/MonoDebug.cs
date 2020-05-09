@@ -6,6 +6,7 @@ using System;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace VSCodeDebug
 {
@@ -110,12 +111,11 @@ namespace VSCodeDebug
 
 		private static void RunSession(Stream inputStream, Stream outputStream)
 		{
-			DebugSession debugSession = new MonoDebugSession();
-			debugSession.TRACE = trace_requests;
-			debugSession.TRACE_RESPONSE = trace_responses;
-			debugSession.Start(inputStream, outputStream).Wait();
+			MonoDebugSession debugSession = new MonoDebugSession(inputStream, outputStream);
+			debugSession.Protocol.LogMessage += (sender, e) => Log (e.Message);
+			debugSession.Run();
 
-			if (logFile!=null)
+			if (logFile != null)
 			{
 				logFile.Flush();
 				logFile.Close();
@@ -125,30 +125,43 @@ namespace VSCodeDebug
 
 		private static void RunServer(int port)
 		{
-			TcpListener serverSocket = new TcpListener(IPAddress.Parse("127.0.0.1"), port);
-			serverSocket.Start();
+			Thread listenThread = new Thread(() =>
+			{
+				TcpListener listener = new TcpListener(IPAddress.Parse("127.0.0.1"), port);
+				listener.Start();
 
-			new System.Threading.Thread(() => {
-				while (true) {
-					var clientSocket = serverSocket.AcceptSocket();
-					if (clientSocket != null) {
-						Program.Log(">> accepted connection from client");
+				while (true)
+				{
+					Socket clientSocket = listener.AcceptSocket();
+					Thread clientThread = new Thread(() =>
+					{
+						Console.WriteLine("Accepted connection");
 
-						new System.Threading.Thread(() => {
-							using (var networkStream = new NetworkStream(clientSocket)) {
-								try {
-									RunSession(networkStream, networkStream);
-								}
-								catch (Exception e) {
-									Console.Error.WriteLine("Exception: " + e);
-								}
-							}
-							clientSocket.Close();
-							Console.Error.WriteLine(">> client connection closed");
-						}).Start();
-					}
+						using (Stream stream = new NetworkStream(clientSocket))
+						{
+							var adapter = new MonoDebugSession(stream, stream);
+							adapter.Protocol.LogMessage += (sender, e) => Console.WriteLine(e.Message);
+							adapter.Protocol.DispatcherError += (sender, e) =>
+							{
+								Console.Error.WriteLine(e.Exception.Message);
+							};
+							adapter.Run();
+							adapter.Protocol.WaitForReader();
+
+							adapter = null;
+						}
+
+						Console.WriteLine("Connection closed");
+					});
+
+					clientThread.Name = "DebugServer connection thread";
+					clientThread.Start();
 				}
-			}).Start();
+			});
+
+			listenThread.Name = "DebugServer listener thread";
+			listenThread.Start();
+			listenThread.Join();
 		}
 	}
 }
