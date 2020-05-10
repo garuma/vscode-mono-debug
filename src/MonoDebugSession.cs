@@ -170,6 +170,9 @@ namespace VSCodeDebug
 		{
 			_clientLinesStartAt1 = arguments.LinesStartAt1.GetValueOrDefault(true);
 			_clientPathsAreURI = arguments.PathFormat == InitializeArguments.PathFormatValue.Uri;
+
+			this.Protocol.SendEvent(new InitializedEvent());
+
 			return new InitializeResponse()
 			{
 				// This debug adapter does not need the configurationDoneRequest.
@@ -189,11 +192,202 @@ namespace VSCodeDebug
 			};
 		}
 
+		protected override LaunchResponse HandleLaunchRequest(LaunchArguments arguments)
+		{
+			_attachMode = false;
+
+			if (arguments.ConfigurationProperties.TryGetValue ("__exceptionOptions", out var exceptionOptions))
+				SetExceptionBreakpoints(exceptionOptions);
+
+			// validate argument 'program'
+			string programPath = getString(arguments.ConfigurationProperties, "program");
+			if (programPath == null) {
+				throw new ProtocolException ("Property 'program' is missing or empty.", new Message (3001, "Property 'program' is missing or empty."));
+			}
+			programPath = ConvertClientPathToDebugger(programPath);
+			if (!File.Exists(programPath) && !Directory.Exists(programPath)) {
+				throw new ProtocolException ("Program does not exist.", new Message (3002, "Program does not exist."));
+			}
+
+			// validate argument 'cwd'
+			var workingDirectory = getString (arguments.ConfigurationProperties, "cwd");
+			if (workingDirectory != null) {
+				workingDirectory = workingDirectory.Trim();
+				if (workingDirectory.Length == 0) {
+					throw new ProtocolException ("Property 'cwd' is empty.", new Message (3003, "Property 'cwd' is empty."));
+				}
+				workingDirectory = ConvertClientPathToDebugger(workingDirectory);
+				if (!Directory.Exists(workingDirectory)) {
+					throw new ProtocolException ("Working directory does not exist", new Message (3004, "Working directory does not exist"));
+				}
+			}
+
+			// validate argument 'runtimeExecutable'
+			var runtimeExecutable = getString (arguments.ConfigurationProperties, "runtimeExecutable");
+			if (runtimeExecutable != null) {
+				runtimeExecutable = runtimeExecutable.Trim();
+				if (runtimeExecutable.Length == 0) {
+					throw new ProtocolException ("Property 'runtimeExecutable' is empty.", new Message (3005, "Property 'runtimeExecutable' is empty."));
+				}
+				runtimeExecutable = ConvertClientPathToDebugger(runtimeExecutable);
+				if (!File.Exists(runtimeExecutable)) {
+					throw new ProtocolException ("Runtime executable does not exist.", new Message (3006, "Runtime executable does not exist."));
+				}
+			}
+
+
+			// validate argument 'env'
+			Dictionary<string, object> env = null;
+			if (arguments.ConfigurationProperties.TryGetValue ("env", out var envConfigurationProp)) {
+				var environmentVariables = envConfigurationProp as JObject;
+				if (environmentVariables != null) {
+					env = new Dictionary<string, object>();
+					foreach (var entry in environmentVariables) {
+						env.Add((string)entry.Key, (string)entry.Value);
+					}
+					if (env.Count == 0) {
+						env = null;
+					}
+				}
+			}
+
+			const string host = "127.0.0.1";
+			int port = Utilities.FindFreePort(55555);
+
+			string mono_path = runtimeExecutable;
+			if (mono_path == null) {
+				if (!Utilities.IsOnPath(MONO)) {
+					throw new ProtocolException ("Can't find runtime on PATH.", new Message (3011, "Can't find runtime on PATH."));
+				}
+				mono_path = MONO;     // try to find mono through PATH
+			}
+
+
+			var cmdLine = new List<String>();
+
+			bool debug = !arguments.NoDebug.GetValueOrDefault (false);
+			if (debug) {
+				cmdLine.Add("--debug");
+				cmdLine.Add(String.Format("--debugger-agent=transport=dt_socket,server=y,address={0}:{1}", host, port));
+			}
+
+			// add 'runtimeArgs'
+			if (arguments.ConfigurationProperties.TryGetValue ("runtimeArgs", out var runtimeArgsConfigurationProp)) {
+				string[] runtimeArguments = runtimeArgsConfigurationProp.ToObject<string[]>();
+				if (runtimeArguments != null && runtimeArguments.Length > 0) {
+					cmdLine.AddRange(runtimeArguments);
+				}
+			}
+
+			// add 'program'
+			if (workingDirectory == null) {
+				// if no working dir given, we use the direct folder of the executable
+				workingDirectory = Path.GetDirectoryName(programPath);
+				cmdLine.Add(Path.GetFileName(programPath));
+			}
+			else {
+				// if working dir is given and if the executable is within that folder, we make the program path relative to the working dir
+				cmdLine.Add(Utilities.MakeRelativePath(workingDirectory, programPath));
+			}
+
+			// add 'args'
+			if (arguments.ConfigurationProperties.TryGetValue ("args", out var argsConfigurationProp)) {
+				string[] configArgs = argsConfigurationProp.ToObject<string[]>();
+				if (configArgs != null && configArgs.Length > 0) {
+					cmdLine.AddRange(configArgs);
+				}
+			}
+
+			// what console?
+			var console = getString(arguments.ConfigurationProperties, "console", null);
+			if (console == null) {
+				// continue to read the deprecated "externalConsole" attribute
+				bool externalConsole = getBool(arguments.ConfigurationProperties, "externalConsole", false);
+				if (externalConsole) {
+					console = "externalTerminal";
+				}
+			}
+
+			if (console == "externalTerminal" || console == "integratedTerminal") {
+
+				cmdLine.Insert(0, mono_path);
+
+				var resp = Protocol.SendClientRequestSync (new RunInTerminalRequest (workingDirectory, cmdLine.ToList ()) {
+					Env = env,
+					Kind = console == "integratedTerminal" ? RunInTerminalArguments.KindValue.Integrated : RunInTerminalArguments.KindValue.External,
+				});
+
+			} else { // internalConsole
+
+				_process = new System.Diagnostics.Process();
+				_process.StartInfo.CreateNoWindow = true;
+				_process.StartInfo.UseShellExecute = false;
+				_process.StartInfo.WorkingDirectory = workingDirectory;
+				_process.StartInfo.FileName = mono_path;
+				_process.StartInfo.Arguments = Utilities.ConcatArgs(cmdLine.ToArray());
+
+				_stdoutEOF = false;
+				_process.StartInfo.RedirectStandardOutput = true;
+				_process.OutputDataReceived += (object sender, System.Diagnostics.DataReceivedEventArgs e) => {
+					if (e.Data == null) {
+						_stdoutEOF = true;
+					}
+					SendOutput(OutputEvent.CategoryValue.Stdout, e.Data);
+				};
+
+				_stderrEOF = false;
+				_process.StartInfo.RedirectStandardError = true;
+				_process.ErrorDataReceived += (object sender, System.Diagnostics.DataReceivedEventArgs e) => {
+					if (e.Data == null) {
+						_stderrEOF = true;
+					}
+					SendOutput(OutputEvent.CategoryValue.Stderr, e.Data);
+				};
+
+				_process.EnableRaisingEvents = true;
+				_process.Exited += (object sender, EventArgs e) => {
+					Terminate("runtime process exited");
+				};
+
+				if (env != null) {
+					// we cannot set the env vars on the process StartInfo because we need to set StartInfo.UseShellExecute to true at the same time.
+					// instead we set the env vars on MonoDebug itself because we know that MonoDebug lives as long as a debug session.
+					foreach (var entry in env) {
+						System.Environment.SetEnvironmentVariable(entry.Key, (string)entry.Value);
+					}
+				}
+
+				var cmd = string.Format("{0} {1}", mono_path, _process.StartInfo.Arguments);
+				SendOutput(OutputEvent.CategoryValue.Console, cmd);
+
+				try {
+					_process.Start();
+					_process.BeginOutputReadLine();
+					_process.BeginErrorReadLine();
+				}
+				catch (Exception) {
+					throw new ProtocolException ("Can't launch terminal", new Message (3012, "Can't launch terminal"));
+				}
+			}
+
+			if (debug) {
+				Connect(IPAddress.Parse(host), port);
+			}
+
+			if (_process == null && !debug) {
+				// we cannot track mono runtime process so terminate this session
+				Terminate("cannot track mono runtime");
+			}
+
+			return new LaunchResponse ();
+		}
+
 		protected override AttachResponse HandleAttachRequest(AttachArguments arguments)
 		{
 			_attachMode = true;
 
-			SetExceptionBreakpoints(arguments.ConfigurationProperties["__exceptionOptions"]);
+			if (arguments.ConfigurationProperties.TryGetValue ("__exceptionOptions", out var exceptionOptions))
+				SetExceptionBreakpoints(exceptionOptions);
 
 			// validate argument 'address'
 			var host = getString(arguments.ConfigurationProperties, "address");
@@ -719,6 +913,8 @@ namespace VSCodeDebug
 
 		private static string getString(Dictionary<string, JToken> args, string property, string dflt = null)
 		{
+			if (!args.ContainsKey (property))
+				return dflt;
 			var s = args[property].ToObject<string> ();
 			if (s == null) {
 				return dflt;

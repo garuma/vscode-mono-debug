@@ -17,44 +17,14 @@ suite('Node Debug Adapter', () => {
 
 	const DEBUG_ADAPTER = Path.join(PROJECT_ROOT, 'bin/Release/mono-debug.exe');
 
-
 	let dc: DebugClient;
 
 	setup( () => {
-		dc = new DebugClient('mono', DEBUG_ADAPTER, 'mono');
+		dc = new DebugClient('mono', DEBUG_ADAPTER, 'mono', {}, true);
 		return dc.start();
 	});
 
 	teardown( () => dc.stop() );
-
-
-	suite('basic', () => {
-
-		test('unknown request should produce error', done => {
-			dc.send('illegal_request').then(() => {
-				done(new Error("does not report error on unknown request"));
-			}).catch(() => {
-				done();
-			});
-		});
-	});
-
-	suite('initialize', () => {
-
-		test('should produce error for invalid \'pathFormat\'', done => {
-			dc.initializeRequest({
-				adapterID: 'mono',
-				linesStartAt1: true,
-				columnsStartAt1: true,
-				pathFormat: 'url'
-			}).then(response => {
-				done(new Error("does not report error on invalid 'pathFormat' attribute"));
-			}).catch(err => {
-				// error expected
-				done();
-			});
-		});
-	});
 
 	suite('launch', () => {
 
@@ -83,7 +53,7 @@ suite('Node Debug Adapter', () => {
 		test('should stop on debugger statement', () => {
 
 			const PROGRAM = Path.join(DATA_ROOT, 'simple_break/Program.exe');
-			const DEBUGGER_LINE = 10;
+			const DEBUGGER_LINE = 11;
 
 			return Promise.all([
 				dc.configurationSequence(),

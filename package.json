@@ -15,9 +15,14 @@
 	"private": true,
 	"scripts": {
 		"watch": "tsc -w -p ./src/typescript",
-		"test": "make tests; mocha --timeout 10000 -u tdd ./out/tests",
+		"test": "mocha --timeout 10000 -u tdd ./out/tests",
 		"vscode:prepublish": "tsc -p ./src/typescript",
 		"compile": "tsc -p ./src/typescript"
+	},
+	"mocha": {
+		"ui": "tdd",
+		"timeout": 10000,
+		"watch-files": "out/tests/*.js"
 	},
 	"engines": {
 		"vscode": "^1.44.0"

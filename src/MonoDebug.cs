@@ -79,7 +79,11 @@ namespace VSCodeDebug
 		{
 			try
 			{
-				Console.Error.WriteLine(format, data);
+				try {
+					Console.Error.WriteLine(format, data);
+				} catch (FormatException) {
+					Console.Error.WriteLine (format);
+				}
 
 				if (LOG_FILE_PATH != null)
 				{
@@ -112,7 +116,8 @@ namespace VSCodeDebug
 		private static void RunSession(Stream inputStream, Stream outputStream)
 		{
 			MonoDebugSession debugSession = new MonoDebugSession(inputStream, outputStream);
-			debugSession.Protocol.LogMessage += (sender, e) => Log (e.Message);
+			debugSession.Protocol.DispatcherError += (e, error) => Program.Log (error.Exception.ToString ());
+			debugSession.Protocol.LogMessage += (sender, e) => Log (e.Message, e.Category);
 			debugSession.Run();
 
 			if (logFile != null)
